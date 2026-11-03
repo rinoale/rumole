@@ -3,12 +3,14 @@
 //! reconnects with exponential backoff when a session drops.
 
 use std::collections::HashMap;
+use std::future::{Future, pending};
+use std::io;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -46,7 +48,13 @@ struct Handle {
 impl Manager {
     pub fn new() -> (Self, mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, tunnels: HashMap::new() }, rx)
+        (
+            Self {
+                tx,
+                tunnels: HashMap::new(),
+            },
+            rx,
+        )
     }
 
     pub fn is_running(&self, name: &str) -> bool {
@@ -114,7 +122,10 @@ impl Manager {
                 ),
                 Err(error) => format!("remote socket cleanup failed: {error}"),
             };
-            let _ = tx.send(Event { name, kind: EventKind::Log(message) });
+            let _ = tx.send(Event {
+                name,
+                kind: EventKind::Log(message),
+            });
         });
         Ok(())
     }
@@ -158,7 +169,11 @@ fn spawn_remote_cleanup(spec: &TunnelSpec, tx: &mpsc::UnboundedSender<Event>) {
     let path = path.to_string();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = Command::new("ssh").args(&args).stdin(Stdio::null()).output().await;
+        let result = Command::new("ssh")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .await;
         if matches!(&result, Ok(output) if output.status.success()) {
             let _ = tx.send(Event {
                 name,
@@ -214,7 +229,11 @@ async fn supervise(
                 send_state(&tx, &spec.name, TunnelState::Idle);
                 return;
             }
-            RunOutcome::Exited { reason, connected, uptime } => {
+            RunOutcome::Exited {
+                reason,
+                connected,
+                uptime,
+            } => {
                 send_log(&tx, &spec.name, format!("session ended: {reason}"));
                 if connected {
                     consecutive_failures = 0;
@@ -252,7 +271,10 @@ async fn supervise(
                 send_state(
                     &tx,
                     &spec.name,
-                    TunnelState::Reconnecting { attempt, retry_at: Instant::now() + delay },
+                    TunnelState::Reconnecting {
+                        attempt,
+                        retry_at: Instant::now() + delay,
+                    },
                 );
                 tokio::select! {
                     _ = sleep(delay) => {}
@@ -296,9 +318,14 @@ async fn run_once(
     let mut relay_port: Option<u16> = None;
 
     if spec.meter {
-        let port = match relay::pick_free_port().await {
-            Ok(port) => port,
-            Err(error) => return exited(format!("no free port for metering relay: {error}")),
+        let port = match spec.kind {
+            // Bind once and keep ownership of the assigned port. Picking and
+            // releasing a free port before rebinding races other sessions.
+            TunnelKind::Remote => 0,
+            TunnelKind::Local | TunnelKind::Dynamic => match relay::pick_free_port().await {
+                Ok(port) => port,
+                Err(error) => return exited(format!("no free port for metering relay: {error}")),
+            },
         };
         let (listen, upstream) = match relay_endpoints(spec, port) {
             Ok(pair) => pair,
@@ -307,8 +334,13 @@ async fn run_once(
         let counters: SharedCounters = Arc::new(Counters::default());
         match Relay::start(listen, upstream, counters.clone()).await {
             Ok(started) => {
+                relay_port = Some(match spec.kind {
+                    TunnelKind::Remote => {
+                        started.local_port().expect("remote relay listens on TCP")
+                    }
+                    TunnelKind::Local | TunnelKind::Dynamic => port,
+                });
                 relay = Some(started);
-                relay_port = Some(port);
             }
             Err(error) => return exited(format!("metering relay failed to bind: {error}")),
         }
@@ -388,44 +420,68 @@ async fn run_once(
         });
     }
 
+    let outcome = monitor_session(
+        &spec.name,
+        tx,
+        cancel,
+        &mut child,
+        wait_for_relay(&mut relay),
+        &stderr_tail,
+    )
+    .await;
+    cleanup_after_exit(spec, relay, tx);
+    outcome
+}
+
+async fn wait_for_relay(relay: &mut Option<Relay>) -> io::Result<()> {
+    match relay {
+        Some(relay) => relay.wait().await,
+        None => pending().await,
+    }
+}
+
+async fn monitor_session(
+    name: &str,
+    tx: &mpsc::UnboundedSender<Event>,
+    cancel: &mut watch::Receiver<bool>,
+    child: &mut Child,
+    relay_exit: impl Future<Output = io::Result<()>>,
+    stderr_tail: &Arc<Mutex<Vec<String>>>,
+) -> RunOutcome {
     let started = Instant::now();
+    let mut connected = false;
 
     // ExitOnForwardFailure=yes means a child that survives the grace period
     // has authenticated and bound its forwardings.
     let grace = sleep(CONNECT_GRACE);
-    tokio::pin!(grace);
-    tokio::select! {
-        status = child.wait() => {
-            cleanup_after_exit(spec, relay.take(), tx);
-            return RunOutcome::Exited {
-                reason: exit_reason(status, &stderr_tail),
-                connected: false,
-                uptime: started.elapsed(),
-            };
-        }
-        _ = cancelled(cancel) => {
-            let _ = child.kill().await;
-            cleanup_after_exit(spec, relay.take(), tx);
-            return RunOutcome::Cancelled;
-        }
-        _ = &mut grace => {}
-    }
-
-    send_state(tx, &spec.name, TunnelState::Connected { since: started });
-
-    tokio::select! {
-        status = child.wait() => {
-            cleanup_after_exit(spec, relay.take(), tx);
-            RunOutcome::Exited {
-                reason: exit_reason(status, &stderr_tail),
-                connected: true,
-                uptime: started.elapsed(),
+    tokio::pin!(grace, relay_exit);
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                return RunOutcome::Exited {
+                    reason: exit_reason(status, stderr_tail),
+                    connected,
+                    uptime: started.elapsed(),
+                };
             }
-        }
-        _ = cancelled(cancel) => {
-            let _ = child.kill().await;
-            cleanup_after_exit(spec, relay.take(), tx);
-            RunOutcome::Cancelled
+            _ = cancelled(cancel) => {
+                let _ = child.kill().await;
+                return RunOutcome::Cancelled;
+            }
+            result = &mut relay_exit => {
+                // Stop ssh before reconnecting, so an alive transport cannot
+                // mask a dead relay and leave the UI permanently connected.
+                let _ = child.kill().await;
+                let reason = match result {
+                    Ok(()) => "metering relay stopped unexpectedly".to_string(),
+                    Err(error) => format!("metering relay failed: {error}"),
+                };
+                return RunOutcome::Exited { reason, connected, uptime: started.elapsed() };
+            }
+            _ = &mut grace, if !connected => {
+                connected = true;
+                send_state(tx, name, TunnelState::Connected { since: started });
+            }
         }
     }
 }
@@ -467,9 +523,10 @@ fn cleanup_after_exit(spec: &TunnelSpec, relay: Option<Relay>, tx: &mpsc::Unboun
     // Dropping the relay unlinks any unix socket it owned.
     drop(relay);
     if !spec.meter
-        && let Some(path) = spec.local_unix_socket() {
-            let _ = relay::remove_stale_socket(&expand_tilde(path));
-        }
+        && let Some(path) = spec.local_unix_socket()
+    {
+        let _ = relay::remove_stale_socket(&expand_tilde(path));
+    }
     // sshd leaves -R unix sockets behind on the remote host.
     spawn_remote_cleanup(spec, tx);
 }
@@ -483,5 +540,118 @@ fn exit_reason(
         (Some(line), _) => line,
         (None, Ok(status)) => format!("ssh exited ({status})"),
         (None, Err(error)) => format!("ssh wait failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn assert_relay_failure_stops_session(after_connected: bool) {
+        // A real long-lived child makes sure we actually kill/reap the ssh
+        // stand-in, rather than just changing the displayed tunnel state.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(
+                monitor_session(
+                    "test",
+                    &tx,
+                    &mut cancel,
+                    &mut child,
+                    async {
+                        fail_rx.await.unwrap();
+                        Err(io::Error::other("injected accept failure"))
+                    },
+                    &stderr_tail,
+                ),
+                async {
+                    if after_connected {
+                        loop {
+                            let event = events.recv().await.unwrap();
+                            if matches!(event.kind, EventKind::State(TunnelState::Connected { .. }))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    fail_tx.send(()).unwrap();
+                },
+            )
+        })
+        .await
+        .expect("relay failure must end the session promptly");
+
+        match outcome {
+            RunOutcome::Exited {
+                reason, connected, ..
+            } => {
+                assert_eq!(reason, "metering relay failed: injected accept failure");
+                assert_eq!(connected, after_connected);
+            }
+            RunOutcome::Cancelled => panic!("relay failure was reported as cancellation"),
+        }
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the ssh child must be reaped"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event.kind,
+                EventKind::State(TunnelState::Connected { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_failure_during_startup_stops_session() {
+        assert_relay_failure_stops_session(false).await;
+    }
+
+    #[tokio::test]
+    async fn relay_failure_after_connect_stops_session() {
+        assert_relay_failure_stops_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn unmetered_session_still_observes_child_exit() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, _events) = mpsc::unbounded_channel();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut relay = None;
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            monitor_session(
+                "test",
+                &tx,
+                &mut cancel,
+                &mut child,
+                wait_for_relay(&mut relay),
+                &stderr_tail,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RunOutcome::Exited {
+                connected: false,
+                ..
+            }
+        ));
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
     }
 }

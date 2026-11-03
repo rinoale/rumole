@@ -93,6 +93,16 @@ per session; rumole carries totals across reconnects in the UI
 dropped and any unix socket it bound is unlinked — a metered `-L`/`-D`
 unix-socket listener can never go stale, because rumole itself owns it.
 
+Transient accept errors (such as a client disconnecting while queued) are
+retried with a short delay. Other accept errors and relay task failures are
+reported to the supervisor with their cause; it stops ssh and applies the
+tunnel's normal reconnect policy. An alive ssh transport alone does not mean
+the relay is healthy.
+
+Connection copies preserve half-closes, but an I/O error in either direction
+closes both sides promptly. Active connection tasks belong to the relay and
+are cancelled when it stops, so reconnects do not retain old sockets.
+
 ## Turning it off
 
 Set `meter = false` on a tunnel (or untick "Meter traffic" in the add/edit
